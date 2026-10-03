@@ -1,0 +1,12 @@
+# Development and CI dependencies.
+#
+# Kept separate from requirements.txt so the production Docker image does not
+# carry a linter. CI installs this file instead of requirements.txt.
+#
+# The monorepo CI ran `pylint` without ever declaring it, which worked locally
+# only when a pylint happened to be on PATH. On a clean runner the step failed
+# with "command not found".
+
+-r requirements.txt
+
+pylint>=3.0

@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+
+    # A dedicated, throwaway PostgreSQL for the integration suite. This is a CI
+    # service container, not an application database: it exists only for the
+    # lifetime of the job and is never reachable from outside the runner.
+    #
+    # `groomio_test` is deliberate. `tests/conftest.py` refuses any
+    # TEST_DATABASE_URL whose database name does not look like a test database,
+    # so a CI misconfiguration fails loudly instead of silently skipping.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: groomio_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    # requirements.txt is at the repository root now. The monorepo version of
+    # this workflow ran `pip install -r groomio-api/requirements.txt`; there is
+    # no groomio-api/ subdirectory in this repository.
+    #
+    # requirements-dev.txt, not requirements.txt: pylint is a CI-only tool and
+    # has no business in the production image. The monorepo workflow invoked
+    # pylint without declaring it anywhere, so the linter step failed with
+    # "command not found" on any runner that did not happen to have pylint on
+    # PATH.
+    - name: Install dependencies
+      run: pip install -r requirements-dev.txt
+
+    # `import-error` only, deliberately.
+    #
+    # The monorepo workflow passed `--enable=import-error,style`. `style` has
+    # not been a pylint checker name for some time, so pylint emitted a
+    # W0012 "unknown option value" warning on every run and the style half of
+    # the check silently did nothing.
+    #
+    # The obvious modernisation — the whole `imports` group — is not viable
+    # yet: it reports 117 findings across app/ and tests/ today, which would
+    # turn the first push red. Widen this deliberately, as a separate change,
+    # rather than discovering the backlog in CI.
+    - name: Run linter
+      run: pylint --disable=all --enable=import-error app tests migrations
+
+    - name: Run tests
+      # SECRET_KEY and DATABASE_URL are required by pydantic-settings at import
+      # time; without them collection fails before a single test runs. Both are
+      # throwaway values for the CI service container above. DATABASE_URL is only
+      # parsed to build an engine — no test connects to it.
+      #
+      # TEST_DATABASE_URL is what actually enables the database-backed suite. The
+      # grep guard fails the job if those tests silently skip, so a broken
+      # provisioning step can never report green.
+      env:
+        SECRET_KEY: ci-throwaway-not-a-real-secret
+        DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/groomio_test
+        TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/groomio_test
+      shell: bash
+      run: |
+        pytest --tb=short -rs 2>&1 | tee /tmp/pytest.log
+        # PIPESTATUS[0] is pytest's own exit code; the `tee` in the pipeline must
+        # not be allowed to mask a real test failure.
+        status=${PIPESTATUS[0]}
+        if [ "$status" -ne 0 ]; then
+          echo "::error::pytest failed with exit code $status"
+          exit "$status"
+        fi
+        # A green run that quietly skipped the database tests is a false green.
+        if grep -q "TEST_DATABASE_URL is not set" /tmp/pytest.log; then
+          echo "::error::Database-backed tests were skipped. TEST_DATABASE_URL did not reach the suite."
+          exit 1
+        fi
+
+  env-template-drift:
+    # `tests/test_env_template.py` pins the env template against
+    # `app.core.config.Settings`. That template now lives in TWO places, and
+    # this job is what stops them from drifting apart:
+    #
+    #   `test`                pins ./.env.example        (this repository)
+    #   `env-template-drift`  pins groomio-infra's      (the deployment superset)
+    #
+    # Both must agree with Settings, so both are checked. This is the check that
+    # a monorepo could not need: there, one file served both purposes.
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout groomio-api
+      uses: actions/checkout@v4
+
+    - name: Checkout groomio-infra
+      uses: actions/checkout@v4
+      with:
+        repository: lassotechnologies-cloud/groomio-infra
+        path: groomio-infra
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      run: pip install -r requirements-dev.txt
+
+    - name: Pin the deployment env template
+      env:
+        SECRET_KEY: ci-throwaway-not-a-real-secret
+        DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/groomio_test
+        GROOMIO_ENV_EXAMPLE: ${{ github.workspace }}/groomio-infra/env.example
+      run: |
+        pytest tests/test_env_template.py -q
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker
+      uses: docker/setup-buildx-action@v3
+
+    # The build context is this repository. The monorepo workflow used
+    # `cd groomio-api && docker build .` with `context: ./`, which no longer
+    # resolves.
+    - name: Build application
+      run: docker build -t groomio-api .
+
+    - name: Push image to registry
+      if: github.event_name == 'push'
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ secrets.DOCKER_REGISTRY }}/groomio-api:${{ github.sha }}

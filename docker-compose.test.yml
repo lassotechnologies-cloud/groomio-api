@@ -1,0 +1,25 @@
+# Test-only PostgreSQL for integration tests.
+# Run: docker compose -f docker-compose.test.yml up -d
+# Then:  createdb -U postgres groomio_test  (or use psql)
+# Finally: TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/groomio_test pytest tests/
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:

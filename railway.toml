@@ -1,0 +1,41 @@
+# Railway configuration for the Groomio API.
+#
+# THREE SERVICES ARE BUILT FROM THIS ONE REPOSITORY — the API, the Celery
+# worker and the Celery beat scheduler. They share the same Dockerfile and the
+# same SQLAlchemy models, so they stay in one repository; only the start command
+# differs, and Railway overrides it per service in the Dashboard.
+#
+#   Service          Start command
+#   -------------    --------------------------------------------------------
+#   groomio-api      (this file) alembic upgrade head && uvicorn app.main:app
+#   groomio-worker   celery -A app.workers.celery_app worker --loglevel=info
+#   groomio-beat     celery -A app.workers.celery_app beat --loglevel=info
+#
+# Because all three import `app.core.config.Settings`, every variable added to
+# that class must be set on all three services or the worker and beat crash on
+# import while the API keeps serving. See groomio-infra/railway.toml.
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Migrations run on boot. Three API replicas would race `alembic upgrade head`,
+# so scale this service to one instance and put concurrency behind it instead.
+startCommand = "sh -c \"alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}\""
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicy = "on-failure"
+restartPolicyMaxRetries = 3
+numReplicas = 1
+
+# Do not auto-deploy the worker and beat from this file. They point at the same
+# repository but need their own start commands, which are service-level settings
+# in the Railway Dashboard rather than repository-level ones.
+
+[scaling]
+minInstances = 1
+maxInstances = 3
+
+[regions]
+primary = "af-south-1"

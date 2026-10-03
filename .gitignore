@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Secrets — NEVER commit. The template is the exception and must stay tracked.
+.env
+.env.*
+!.env.example
+
+# Alembic / runtime logs
+*.log
+
+# Local database and Redis dumps
+*.dump
+dump.rdb
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

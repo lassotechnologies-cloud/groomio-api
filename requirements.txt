@@ -1,0 +1,28 @@
+fastapi>=0.110
+uvicorn[standard]>=0.30
+sqlalchemy[asyncio]>=2.0
+asyncpg>=0.29
+alembic>=1.14
+pydantic>=2.7
+pydantic-settings>=2.4
+python-jose[cryptography]>=3.3
+passlib[argon2]>=1.7
+argon2-cffi>=23.1
+redis>=5.0
+celery>=5.4
+kombu>=5.4
+aiohttp>=3.10
+httpx>=0.27
+boto3>=1.34
+africastalking>=2.0
+python-multipart>=0.0.12
+python-dotenv>=1.0
+# AI Studio poster + slideshow composition (Doc 2.13). Composing rather than
+# generating is deliberate: true generative video is Phase 3, and this needs no
+# API key, runs offline and cannot fail because a model vendor is down.
+Pillow>=10.0
+sentry-sdk>=2.10
+pytest>=8.0
+pytest-asyncio>=0.23
+pytest-httpx>=0.30
+playwright>=1.45
