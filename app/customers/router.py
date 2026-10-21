@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import cast, func, or_, select
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -76,7 +77,9 @@ async def _staff_name_map(
 
     stmt = (
         select(Staff.id, User.full_name)
-        .join(User, User.id == Staff.user_id)
+        # `staff.user_id` is VARCHAR and `users.id` is UUID; PostgreSQL has no
+        # `uuid = varchar` operator, so the join needs an explicit cast.
+        .join(User, User.id == cast(Staff.user_id, UUID))
         .where(Staff.id.in_(staff_ids))
     )
     return {str(sid): name for sid, name in (await db.execute(stmt)).all()}

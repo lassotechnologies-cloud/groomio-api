@@ -29,7 +29,11 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.deps import CurrentUser, require_role
+from app.core.deps import (
+    CurrentUser,
+    require_active_business,
+    require_role,
+)
 from app.core.phone import normalize_phone
 from app.core.security import now_utc
 from app.core.tenancy import resolve_business_id
@@ -62,6 +66,11 @@ router = APIRouter(tags=["messaging"])
 Db = Annotated[AsyncSession, Depends(get_db)]
 StaffOnly = Depends(require_role("owner", "clerk", "barber"))
 OwnerOnly = Depends(require_role("owner"))
+# This router exposes public customer-facing thread reads and an
+# intentionally auth-less push unsubscribe, so the subscription
+# guard (T004-12) is applied per endpoint rather than at the
+# router level.
+ActiveBusiness = Depends(require_active_business)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -99,7 +108,11 @@ def _preview(body: str) -> str:
 
 
 # ── I1 — thread list (shop side) ───────────────────────────────────────────
-@router.get("/threads", response_model=list[ThreadResponse], dependencies=[StaffOnly])
+@router.get(
+    "/threads",
+    response_model=list[ThreadResponse],
+    dependencies=[StaffOnly, ActiveBusiness],
+)
 async def list_threads(
     db: Db,
     user: CurrentUser,
@@ -236,7 +249,7 @@ async def public_thread_messages(
 @router.get(
     "/threads/{thread_id}/messages",
     response_model=list[MessageResponse],
-    dependencies=[StaffOnly],
+    dependencies=[StaffOnly, ActiveBusiness],
 )
 async def thread_messages(
     thread_id: str, db: Db, user: CurrentUser, limit: int = Query(100, ge=1, le=200)
@@ -326,7 +339,7 @@ async def public_send_message(
     "/threads/{thread_id}/messages",
     response_model=MessageSendResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[StaffOnly],
+    dependencies=[StaffOnly, ActiveBusiness],
 )
 async def send_message(
     thread_id: str, payload: MessageCreateRequest, db: Db, user: CurrentUser
@@ -394,7 +407,11 @@ async def _send(
 
 
 # ── I4 — web push subscriptions ────────────────────────────────────────────
-@router.post("/push/subscribe", response_model=PushSubscribeResponse)
+@router.post(
+    "/push/subscribe",
+    response_model=PushSubscribeResponse,
+    dependencies=[ActiveBusiness],
+)
 async def push_subscribe(
     payload: PushSubscribeRequest, db: Db, user: CurrentUser
 ) -> PushSubscribeResponse:
@@ -441,7 +458,9 @@ async def push_unsubscribe(
 
 # ── I5 — the in-app inbox ──────────────────────────────────────────────────
 @router.get(
-    "/notifications", response_model=NotificationListResponse, dependencies=[StaffOnly]
+    "/notifications",
+    response_model=NotificationListResponse,
+    dependencies=[StaffOnly, ActiveBusiness],
 )
 async def list_notifications(
     db: Db,
@@ -471,7 +490,7 @@ async def list_notifications(
 @router.patch(
     "/notifications/{notification_id}/read",
     response_model=NotificationResponse,
-    dependencies=[StaffOnly],
+    dependencies=[StaffOnly, ActiveBusiness],
 )
 async def mark_notification_read(
     notification_id: str, db: Db, user: CurrentUser
@@ -522,7 +541,9 @@ def _campaign_out(c: Campaign, recipients: int = 0) -> CampaignResponse:
 
 
 @router.get(
-    "/campaigns", response_model=list[CampaignResponse], dependencies=[OwnerOnly]
+    "/campaigns",
+    response_model=list[CampaignResponse],
+    dependencies=[OwnerOnly, ActiveBusiness],
 )
 async def list_campaigns(
     db: Db, user: CurrentUser, limit: int = Query(50, ge=1, le=200)

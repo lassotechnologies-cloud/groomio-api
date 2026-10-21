@@ -38,19 +38,30 @@ def _now() -> datetime:
 
 
 class _FakeSession:
-    """Answers `_apply_payment`'s two `db.scalar` calls with fixed rows.
+    """Answers `_apply_payment`'s `db.scalar` calls with fixed rows.
 
-    Results are queued in call order: Subscription first, then Plan. Relying on
-    order rather than trying to introspect the query is deliberate — an earlier
-    version matched on the mapped class by digging through `_raw_columns`, which
-    is private API and broke the moment SQLAlchemy changed. Keying on call order
-    breaks only if the function's query order changes, which is visible in review.
+    Results are queued in call order: the locked Payment re-fetch
+    (`SELECT ... FOR UPDATE`) first, then Subscription, then Plan,
+    then the Business mirror lookup. Relying on order rather than
+    trying to introspect the query is deliberate — an earlier
+    version matched on the mapped class by digging through
+    `_raw_columns`, which is private API and broke the moment
+    SQLAlchemy changed. Keying on call order breaks only if the
+    function's query order changes, which is visible in review.
     """
 
-    def __init__(self, sub: Subscription | None, plan: Plan | None = None):
+    def __init__(
+        self,
+        payment: Payment,
+        sub: Subscription | None,
+        plan: Plan | None = None,
+        biz: None = None,
+    ):
         self._results = [
+            payment,
             sub,
             plan or Plan(id="plan_monthly", interval_days=DAY, price_kes=1000),
+            biz,  # Business mirror: None means no row to sync
         ]
         self.flushes = 0
 
@@ -87,7 +98,7 @@ def _subscription(status: str = "active", days_left: int = 0) -> Subscription:
 async def test_a_pending_success_extends_the_subscription():
     sub = _subscription(days_left=0)
     payment = _payment("pending")
-    db = _FakeSession(sub)
+    db = _FakeSession(payment, sub)
 
     await _apply_payment(db, payment)
 
@@ -102,7 +113,7 @@ async def test_applying_twice_does_not_extend_twice():
     """A replayed webhook is normal — providers retry until they get a 200."""
     sub = _subscription(days_left=0)
     payment = _payment("pending")
-    db = _FakeSession(sub)
+    db = _FakeSession(payment, sub)
 
     await _apply_payment(db, payment)
     first_end = sub.current_period_end
@@ -123,7 +134,7 @@ async def test_a_failed_payment_never_extends_the_subscription():
     sub = _subscription(days_left=5)
     end_before = sub.current_period_end
     payment = _payment("failed")
-    db = _FakeSession(sub)
+    db = _FakeSession(payment, sub)
 
     await _apply_payment(db, payment)
 
@@ -137,7 +148,7 @@ async def test_an_already_successful_payment_is_not_reapplied():
     sub = _subscription(days_left=5)
     end_before = sub.current_period_end
     payment = _payment("success")
-    db = _FakeSession(sub)
+    db = _FakeSession(payment, sub)
 
     await _apply_payment(db, payment)
 
@@ -150,7 +161,7 @@ async def test_a_timed_out_payment_never_extends():
     sub = _subscription(days_left=5)
     end_before = sub.current_period_end
     payment = _payment("timeout")
-    db = _FakeSession(sub)
+    db = _FakeSession(payment, sub)
 
     await _apply_payment(db, payment)
 
@@ -175,7 +186,7 @@ async def test_renewing_early_keeps_the_remaining_days():
         current_period_end=now + timedelta(days=5),
     )
     payment = _payment("pending")
-    db = _FakeSession(sub)
+    db = _FakeSession(payment, sub)
 
     await _apply_payment(db, payment)
 
@@ -197,7 +208,7 @@ async def test_renewing_after_expiry_starts_from_now():
         current_period_end=now - timedelta(days=30),
     )
     payment = _payment("pending")
-    db = _FakeSession(sub)
+    db = _FakeSession(payment, sub)
 
     await _apply_payment(db, payment)
 
@@ -214,7 +225,7 @@ async def test_a_missing_subscription_fails_the_payment_without_raising():
     never be applied.
     """
     payment = _payment("pending")
-    db = _FakeSession(None)
+    db = _FakeSession(payment, None)
 
     await _apply_payment(db, payment)
 
@@ -234,7 +245,7 @@ async def test_a_trial_renewal_preserves_the_remaining_trial():
         current_period_end=now + timedelta(days=11),
     )
     payment = _payment("pending")
-    db = _FakeSession(sub)
+    db = _FakeSession(payment, sub)
 
     await _apply_payment(db, payment)
 

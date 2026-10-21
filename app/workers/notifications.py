@@ -81,8 +81,15 @@ async def notify_once(db: AsyncSession, **kwargs) -> Notification | None:
         return None
 
     try:
-        return await notify(db, **kwargs)
+        # The insert runs inside a savepoint, not the caller's
+        # transaction: a concurrent task that inserted the same
+        # notification first makes the INSERT fail, and rolling
+        # the whole transaction back would discard every other
+        # notification this batch wrote. Rolling back to the
+        # savepoint discards only this one row and leaves the
+        # session usable for the rest of the batch.
+        async with db.begin_nested():
+            return await notify(db, **kwargs)
     except IntegrityError:
         # A concurrent task inserted the same row. Not an error worth retrying.
-        await db.rollback()
         return None

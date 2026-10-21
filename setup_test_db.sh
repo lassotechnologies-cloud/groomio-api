@@ -30,7 +30,10 @@ docker exec "$CONTAINER" psql -U postgres -tc "SELECT 1 FROM pg_database WHERE d
 
 echo ""
 echo "Done. Run tests with:"
-echo "  TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/groomio_test pytest tests/ -v"
+echo "  TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5433/groomio_test python -m pytest tests/ -v"
+echo ""
+echo "Note the port: 5433, not 5432. Port 5432 is this machine's development"
+echo "PostgreSQL, and the test suite drops and recreates the schema on every run."
 echo ""
 echo "To stop:"
 echo "  docker compose -f docker-compose.test.yml down"

@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     mpesa_consumer_key: str = ""
     mpesa_consumer_secret: str = ""
     mpesa_base_url: str = "https://sandbox.safaricom.co.ke"
-    mpesa_stk_push_url: str = "https://sandbox.safaricom.co.ke/mpesa/stkpush/v2/query"
+    mpesa_stk_push_url: str = "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest"
     mpesa_callback_url: str = "https://api.groomio.app/v1/payments/webhooks/daraja"
     # The paybill/till number Safaricom expects, plus the passkey issued with it.
     mpesa_shortcode: str = ""
@@ -75,6 +75,15 @@ class Settings(BaseSettings):
     grace_days: int = 3
     remind_trial_days: str = "7,9,10"
     remind_before_renewal_days: int = 3
+    # A payment no provider has answered within this window is
+    # marked `timeout` by the payment-timeout sweep. Long enough
+    # that a delayed M-Pesa callback still lands first.
+    payment_pending_timeout_hours: int = 24
+    # The timezone day-boundaries are drawn in. Beat schedules are
+    # already EAT (Africa/Nairobi); reminder and report windows must
+    # bucket by the same local day, not UTC midnight, or a shop whose
+    # trial ends at 01:00 EAT is told a day early (T004-24).
+    business_timezone: str = "Africa/Nairobi"
 
     # OTP
     otp_ttl_min: int = 10

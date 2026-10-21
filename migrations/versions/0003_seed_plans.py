@@ -12,7 +12,6 @@ Create Date: 2026-09-28
 
 from alembic import op
 import sqlalchemy as sa
-from sqlalchemy.dialects.postgresql import UUID
 
 # revision identifiers, used by Alembic.
 revision = "0003"
@@ -32,17 +31,16 @@ PLANS = [
 
 
 def upgrade() -> None:
-    plans = sa.table(
-        "plans",
-        sa.column("id", UUID),
-        sa.column("code", sa.String),
-        sa.column("price_kes", sa.Integer),
-        sa.column("interval_days", sa.SmallInteger),
-        sa.column("discount_pct", sa.SmallInteger),
-        sa.column("is_active", sa.Boolean),
-    )
-    op.bulk_insert(
-        plans,
+    # asyncpg refuses to bind a VARCHAR parameter into an enum column,
+    # so cast explicitly to plan_code (the column's type). id is left
+    # out — it defaults to gen_random_uuid().
+    op.get_bind().execute(
+        sa.text(
+            "INSERT INTO plans "
+            "(code, price_kes, interval_days, discount_pct, is_active) "
+            "VALUES (CAST(:code AS plan_code), :price_kes, :interval_days, "
+            ":discount_pct, :is_active)"
+        ),
         [
             {
                 "code": code,

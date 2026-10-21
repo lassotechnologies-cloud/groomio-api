@@ -95,7 +95,9 @@ async def list_expenses(
     business_id = await resolve_business_id(db, user)
 
     branch_ids = [
-        b.id
+        # `expenses.branch_id` is VARCHAR and `Branch.id` is a UUID; the ids are
+        # rendered as text so they can be bound to the IN() below.
+        str(b.id)
         for b in await db.scalars(select(Branch).where(Branch.business_id == business_id))
     ]
     if not branch_ids:

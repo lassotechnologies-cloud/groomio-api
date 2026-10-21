@@ -33,4 +33,12 @@ class WebhookEvent(Base, TimestampMixin):
     payload = Column(JSONB, nullable=False)
     processed_at = Column(DateTime(timezone=True), nullable=True)
 
-    __table_args__ = (Index("ix_webhook_events_unprocessed", "source", "processed_at"),)
+    __table_args__ = (
+        Index("ix_webhook_events_unprocessed", "source", "processed_at"),
+        Index(
+            "uq_webhook_events_source_ref",
+            "source",
+            "event_ref",
+            unique=True,
+        ),
+    )

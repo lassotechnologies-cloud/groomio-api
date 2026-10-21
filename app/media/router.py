@@ -18,7 +18,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from app.core.deps import CurrentUser
+from app.core.deps import CurrentUser, require_active_business
 from app.core.storage import (
     ALLOWED_IMAGE_EXT,
     ALLOWED_VIDEO_EXT,
@@ -57,7 +57,14 @@ class UploadUrlResponse(BaseModel):
     content_type: str
 
 
-@router.post("/media/upload-url", response_model=UploadUrlResponse)
+@router.post(
+    "/media/upload-url",
+    response_model=UploadUrlResponse,
+    # The limits read below is public (a client needs it before it
+    # can log in); the presign is not, and an expired or suspended
+    # tenant must not be able to upload (T004-12).
+    dependencies=[Depends(require_active_business)],
+)
 async def create_upload_url(
     payload: UploadUrlRequest, db: Db, user: CurrentUser
 ) -> UploadUrlResponse:

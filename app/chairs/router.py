@@ -8,7 +8,8 @@ Marking a chair `offline` removes it from that capacity without deleting history
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import cast, func, select
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.chairs.schemas import ChairCreateRequest, ChairResponse, ChairUpdateRequest
@@ -53,7 +54,9 @@ async def _assigned_names(db: AsyncSession, staff_ids: set[str]) -> dict[str, st
         return {}
     stmt = (
         select(Staff.id, User.full_name)
-        .join(User, User.id == Staff.user_id)
+        # `staff.user_id` is VARCHAR and `users.id` is UUID; PostgreSQL has no
+        # `uuid = varchar` operator, so the join needs an explicit cast.
+        .join(User, User.id == cast(Staff.user_id, UUID))
         .where(Staff.id.in_(staff_ids))
     )
     return {str(sid): name for sid, name in (await db.execute(stmt)).all()}

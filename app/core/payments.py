@@ -85,7 +85,7 @@ async def daraja_stk_push(
                 "TransactionType": "CustomerPayBillOnline",
                 "Amount": amount_kes,
                 "PartyA": settings.mpesa_shortcode,
-                "PartyB": str(account_ref),
+                "PartyB": settings.mpesa_shortcode,
                 "PhoneNumber": phone.lstrip("+"),
                 "CallBackURL": settings.mpesa_callback_url,
                 "AccountReference": str(account_ref),
@@ -185,13 +185,13 @@ def verify_pesapal_ipn_signature(
     """Recompute Pesapal's IPN signature and compare in constant time.
 
     Pesapal signs the notification fields *in this exact order*, joined with
-    spaces, then SHA-512s the result and base64s it. The order is the whole
+    single spaces, then SHA-512s the result and base64s it. The order is the whole
     security property — a hash over a differently-ordered concatenation would
     verify nothing, so the field sequence is spelled out rather than looped.
     """
     if not all((notification_type, notification_id, notification_details, signature)):
         return False
 
-    payload = f"{notification_type}{notification_id}{notification_details}{settings.pesapal_merchant_id}"
+    payload = f"{notification_type} {notification_id} {notification_details} {settings.pesapal_merchant_id}"
     expected = base64.b64encode(hashlib.sha512(payload.encode()).digest()).decode()
     return hmac.compare_digest(expected, signature)

@@ -21,7 +21,7 @@ from sqlalchemy import func, select, update
 from app.models.messaging import Campaign, CampaignRecipient, Notification
 from app.models.money import Sale
 from app.models.people import Customer
-from app.workers.db import run_async, session_scope
+from app.workers.db import beat_task, run_async, session_scope
 
 BATCH_SIZE = 200
 
@@ -124,6 +124,7 @@ def dispatch_scheduled_campaigns(self):
     """
     now = _now()
 
+    @beat_task("campaign-dispatch")
     async def _dispatch() -> dict:
         async with session_scope() as db:
             due = list(

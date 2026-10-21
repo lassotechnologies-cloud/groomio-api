@@ -12,10 +12,13 @@ single email — an owner in a busy barbershop opens the app, they do not read m
 
 The day-ladder is compared by calendar date rather than by elapsed hours, so a
 task that was down for a day still fires for the days it missed that are still in
-the future.
+the future. The calendar is the shop's own (EAT by default, see
+`settings.business_timezone`): a trial ending at 01:00 EAT ends *tomorrow* for
+that shop, and bucketing by UTC midnight would tell the owner a day early (T004-24).
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from celery import shared_task
 from sqlalchemy import select
@@ -23,18 +26,26 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.models.billing import Plan, Subscription
 from app.models.tenant import Business
-from app.workers.db import run_async, session_scope
+from app.workers.db import beat_task, run_async, session_scope
 from app.workers.notifications import notify_once
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(ZoneInfo(settings.business_timezone))
 
 
 def _start_of_day(moment: datetime) -> datetime:
-    return moment.replace(hour=0, minute=0, second=0, microsecond=0)
+    """Midnight in the shop's timezone, as an aware datetime.
+
+    Aware, not naive: the comparison against `current_period_end`
+    (a timestamptz) then happens at the right instant, and the
+    day-window [midnight, midnight+1) is a local day, not a UTC one.
+    """
+    local = moment.astimezone(ZoneInfo(settings.business_timezone))
+    return local.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
+@beat_task("subscription-reminders")
 async def _remind() -> dict:
     now = _now()
     today = _start_of_day(now)

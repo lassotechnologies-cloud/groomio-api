@@ -27,13 +27,14 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.models.billing import Subscription
 from app.models.tenant import Business
-from app.workers.db import run_async, session_scope
+from app.workers.db import beat_task, run_async, session_scope
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+@beat_task("subscription-state")
 async def _advance() -> dict:
     now = _now()
     grace_cutoff = now - timedelta(days=settings.grace_days)

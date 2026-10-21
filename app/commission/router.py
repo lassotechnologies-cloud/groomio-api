@@ -13,7 +13,8 @@ from datetime import date, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import cast, func, select
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -52,7 +53,9 @@ async def _names(db: AsyncSession, staff_ids: set[str]) -> dict[str, str]:
         return {}
     stmt = (
         select(Staff.id, User.full_name)
-        .join(User, User.id == Staff.user_id)
+        # `staff.user_id` is VARCHAR and `users.id` is UUID; PostgreSQL has no
+        # `uuid = varchar` operator, so the join needs an explicit cast.
+        .join(User, User.id == cast(Staff.user_id, UUID))
         .where(Staff.id.in_(staff_ids))
     )
     return {str(sid): name for sid, name in (await db.execute(stmt)).all()}
@@ -87,11 +90,12 @@ async def my_commissions(
     rows = list(
         await db.scalars(
             select(Commission)
-            .where(Commission.staff_id == me.id)
+            # `commissions.staff_id` is VARCHAR; `Staff.id` is a UUID.
+            .where(Commission.staff_id == str(me.id))
             .order_by(Commission.period_start.desc())
         )
     )
-    names = {me.id: None}
+    names = {str(me.id): None}
     return [_out(r, names) for r in rows]
 
 
@@ -113,9 +117,11 @@ async def my_live_earnings(
     # through it rather than guessing at a column that is not there.
     total = await db.scalar(
         select(func.coalesce(func.sum(SaleItem.commission_kes), 0))
-        .join(Sale, Sale.id == SaleItem.sale_id)
+        # `sale_items.sale_id` is VARCHAR and `sales.id` is UUID, so the join
+        # needs an explicit cast.
+        .join(Sale, Sale.id == cast(SaleItem.sale_id, UUID))
         .where(
-            Sale.staff_id == me.id,
+            Sale.staff_id == str(me.id),
             Sale.created_at >= start,
             Sale.created_at < end,
         )
@@ -174,7 +180,7 @@ async def set_bonus(
     business_id = await resolve_business_id(db, user)
 
     staff_ids = {
-        s.id
+        str(s.id)
         for s in await db.scalars(select(Staff).where(Staff.business_id == business_id))
     }
     row = await db.scalar(select(Commission).where(Commission.id == commission_id))

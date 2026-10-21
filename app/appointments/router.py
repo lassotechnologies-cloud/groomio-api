@@ -14,7 +14,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import cast, select
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.appointments.schemas import (
@@ -73,6 +74,28 @@ async def _load_branch(db: AsyncSession, business_id: str, branch_id: str) -> Br
             status_code=status.HTTP_404_NOT_FOUND, detail="Branch not found"
         )
     return branch
+
+
+async def _load_bookable_staff(
+    db: AsyncSession, staff_id: str, branch_id: str, business_id: str
+) -> Staff:
+    """The barber a booking names, resolved against the shop it is being booked at.
+
+    Without this, one shop's calendar accepts another shop's barber id and the
+    double-booking guard then blocks the wrong person in the wrong branch. 404,
+    not 403: a valid id from another shop must stay indistinguishable from one
+    that does not exist (Doc 11.3).
+    """
+    staff = await db.scalar(
+        select(Staff).where(
+            Staff.id == staff_id,
+            Staff.business_id == business_id,
+            Staff.branch_id == branch_id,
+        )
+    )
+    if not staff:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    return staff
 
 
 async def _price_services(
@@ -139,7 +162,9 @@ async def _staff_names(db: AsyncSession, staff_ids: set[str]) -> dict[str, str]:
         return {}
     stmt = (
         select(Staff.id, User.full_name)
-        .join(User, User.id == Staff.user_id)
+        # `staff.user_id` is VARCHAR and `users.id` is UUID; PostgreSQL has no
+        # `uuid = varchar` operator, so the join needs an explicit cast.
+        .join(User, User.id == cast(Staff.user_id, UUID))
         .where(Staff.id.in_(staff_ids))
     )
     return {str(sid): name for sid, name in (await db.execute(stmt)).all()}
@@ -173,7 +198,9 @@ async def _serialize(
 
     names: dict[str, str] = {}
     for c in await db.scalars(select(Customer).where(Customer.id.in_(customer_ids))):
-        names[c.id] = c.full_name
+        # `appointment.customer_id` is read back as text, so the map is keyed by
+        # the id rendered as text or the name is silently lost on every response.
+        names[str(c.id)] = c.full_name
     staff_names = await _staff_names(db, {a.staff_id for a in appts})
 
     out = []
@@ -262,6 +289,7 @@ async def create_appointment(
     biz = await _business_for(db, user)
     business_id = str(biz.id)
     await _load_branch(db, business_id, payload.branch_id)
+    await _load_bookable_staff(db, payload.staff_id, payload.branch_id, business_id)
 
     services = await _price_services(db, payload.branch_id, payload.service_ids)
     duration = sum(s.duration_min for s in services)
@@ -311,7 +339,9 @@ async def create_appointment(
         db.add(
             AppointmentService(
                 appointment_id=str(appt.id),
-                service_id=svc.id,
+                # `appointment_services.service_id` is VARCHAR; `Service.id` is a
+                # UUID and must not be bound to it directly.
+                service_id=str(svc.id),
                 price_kes=svc.price_kes,
             )
         )
@@ -354,7 +384,21 @@ async def public_book(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
 
     business_id = branch.business_id
-    services = await _price_services(db, branch.id, payload.service_ids)
+    # The public slot route already refuses a barber who is not active at this
+    # branch; the booking write has to apply the same rule, or the guard exists
+    # only on the read path and any client can skip it.
+    staff = await db.scalar(
+        select(Staff).where(
+            Staff.id == payload.staff_id,
+            Staff.business_id == business_id,
+            Staff.branch_id == str(branch.id),
+            Staff.status == "active",
+        )
+    )
+    if not staff:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    services = await _price_services(db, str(branch.id), payload.service_ids)
     duration = sum(s.duration_min for s in services)
 
     # Only free slots are offered publicly — the same check staff booking uses.
@@ -381,7 +425,7 @@ async def public_book(
     if not customer:
         customer = Customer(
             business_id=business_id,
-            branch_id=branch.id,
+            branch_id=str(branch.id),
             full_name=payload.customer_name,
             phone=payload.customer_phone,
             loyalty_points=0,
@@ -393,8 +437,8 @@ async def public_book(
 
     appt = Appointment(
         business_id=business_id,
-        branch_id=branch.id,
-        customer_id=customer.id,
+        branch_id=str(branch.id),
+        customer_id=str(customer.id),
         staff_id=payload.staff_id,
         scheduled_at=payload.scheduled_at,
         duration_min=duration,
@@ -409,7 +453,7 @@ async def public_book(
         db.add(
             AppointmentService(
                 appointment_id=str(appt.id),
-                service_id=svc.id,
+                service_id=str(svc.id),
                 price_kes=svc.price_kes,
             )
         )
@@ -456,7 +500,9 @@ async def update_appointment_status(
 
     if user["role"] == "barber":
         staff = await db.scalar(select(Staff).where(Staff.user_id == user["user_id"]))
-        if not staff or staff.id != appt.staff_id:
+        # `staff.id` is a UUID and `appointment.staff_id` is read back as text;
+        # compared raw, a barber is refused their own appointment.
+        if not staff or str(staff.id) != appt.staff_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Barbers can only update their own appointments",

@@ -15,9 +15,37 @@ from app.models.base import Base, TimestampMixin, uuid_pk
 
 
 class Business(Base, TimestampMixin):
-    """One row per paying shop/salon (the "tenant" = the locked private office)."""
+    """One row per paying shop/salon (the "tenant" = the locked private office).
+
+    **One owner owns exactly one business.** That is the approved Groomio MVP rule
+    (many branches per business, but not many businesses per owner), and it is
+    enforced here rather than trusted to application code.
+
+    Why a database index and not an application check: every read path that
+    resolves a tenant — `core.tenancy.resolve_business_id`, `queue`, `appointments`,
+    `customers` — does `SELECT … WHERE owner_user_id = :uid` with no `LIMIT 1`
+    and simply takes the row it gets first. Two rows therefore do not just sit
+    there producing a duplicate shop; they make tenant resolution return an
+    *arbitrary* business on different endpoints for the same token. A unique
+    index makes the second row impossible instead of merely unlikely.
+
+    It is a **plain** unique index, not a partial one. `owner_user_id` is
+    `NOT NULL`, so `WHERE owner_user_id IS NOT NULL` would restrict the index to
+    every row and encode a product decision that does not exist yet — nothing in
+    Groomio supports releasing a shop and opening another under the same owner.
+
+    `ix_businesses_owner_user_id` (created by migration 0002) is now redundant
+    with this one: a unique index on the same single column serves the same
+    lookups. Dropping it is safe and saves write amplification on a hot column,
+    but it is deliberately *not* bundled into the fix — see the deployment notes
+    in `docs/T-003-business-onboarding-concurrency.md`.
+    """
 
     __tablename__ = "businesses"
+
+    __table_args__ = (
+        Index("uq_businesses_owner_user_id", "owner_user_id", unique=True),
+    )
 
     id = uuid_pk()
     owner_user_id = Column(String, nullable=False, index=True)

@@ -15,7 +15,8 @@ from datetime import date, datetime
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import cast, select
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -62,7 +63,10 @@ async def _staff_names(db: AsyncSession, staff_ids: set[str]) -> dict[str, tuple
         return {}
     stmt = (
         select(Staff.id, User.full_name, User.phone)
-        .join(User, User.id == Staff.user_id)
+        # `staff.user_id` is VARCHAR and `users.id` is UUID; PostgreSQL has no
+        # `uuid = varchar` operator, and `user_id` always holds the uuid rendered
+        # as text, so casting it back is lossless.
+        .join(User, User.id == cast(Staff.user_id, UUID))
         .where(Staff.id.in_(staff_ids))
     )
     return {
@@ -71,7 +75,9 @@ async def _staff_names(db: AsyncSession, staff_ids: set[str]) -> dict[str, tuple
 
 
 def _out(staff: Staff, names: dict[str, tuple[str, str]]) -> StaffResponse:
-    name, phone = names.get(staff.id, (None, None))
+    # `_staff_names` keys its result by the id rendered as text; `staff.id` is a
+    # UUID, so the lookup has to be normalised or the name is silently dropped.
+    name, phone = names.get(str(staff.id), (None, None))
     return StaffResponse(
         id=str(staff.id),
         business_id=staff.business_id,
@@ -166,7 +172,7 @@ async def create_staff(
     db.add(staff)
     await db.flush()
 
-    return _out(staff, {staff.id: (account.full_name, account.phone)})
+    return _out(staff, {str(staff.id): (account.full_name, account.phone)})
 
 
 @router.patch("/staff/{staff_id}", response_model=StaffResponse, dependencies=[OwnerOnly])
@@ -195,13 +201,17 @@ async def update_staff(
             setattr(staff, field, value)
 
     if payload.full_name:
-        account = await db.scalar(select(User).where(User.id == staff.user_id))
+        account = await db.scalar(
+            select(User).where(User.id == cast(staff.user_id, UUID))
+        )
         if account:
             account.full_name = payload.full_name
 
     if payload.status:
         staff.status = payload.status
-        account = await db.scalar(select(User).where(User.id == staff.user_id))
+        account = await db.scalar(
+            select(User).where(User.id == cast(staff.user_id, UUID))
+        )
         if account:
             # Suspending the staff row without the login would leave someone able
             # to sign in and act on data they should no longer reach.
@@ -224,7 +234,9 @@ async def list_schedules(
     business_id = await resolve_business_id(db, user)
     if user["role"] == "barber":
         me = await resolve_staff_for_user(db, user)
-        if me.id != staff_id:
+        # `staff_id` comes from the URL as text; `me.id` is a UUID. Compared
+        # without normalising, a barber is refused their own schedule.
+        if str(me.id) != staff_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail="Own schedule only"
             )
@@ -309,7 +321,7 @@ async def check_in(staff_id: str, db: Db, user: CurrentUser) -> AttendanceRespon
     business_id = await resolve_business_id(db, user)
     if user["role"] == "barber":
         me = await resolve_staff_for_user(db, user)
-        if me.id != staff_id:
+        if str(me.id) != staff_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail="Own attendance only"
             )
@@ -349,7 +361,7 @@ async def check_out(staff_id: str, db: Db, user: CurrentUser) -> AttendanceRespo
     business_id = await resolve_business_id(db, user)
     if user["role"] == "barber":
         me = await resolve_staff_for_user(db, user)
-        if me.id != staff_id:
+        if str(me.id) != staff_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail="Own attendance only"
             )
@@ -396,7 +408,7 @@ async def list_leave_requests(
     business_id = await resolve_business_id(db, user)
 
     staff_ids = {
-        s.id
+        str(s.id)
         for s in await db.scalars(
             select(Staff).where(Staff.business_id == business_id)
         )
@@ -433,7 +445,7 @@ async def list_my_leave_requests(db: Db, user: CurrentUser) -> list[LeaveRequest
     rows = list(
         await db.scalars(
             select(LeaveRequest)
-            .where(LeaveRequest.staff_id == me.id)
+            .where(LeaveRequest.staff_id == str(me.id))
             .order_by(LeaveRequest.start_date.desc())
         )
     )
@@ -467,7 +479,7 @@ async def create_leave_request(
 
     overlap = await db.scalar(
         select(LeaveRequest).where(
-            LeaveRequest.staff_id == me.id,
+            LeaveRequest.staff_id == str(me.id),
             LeaveRequest.status == "pending",
             LeaveRequest.start_date <= payload.end_date,
             LeaveRequest.end_date >= payload.start_date,
@@ -479,7 +491,7 @@ async def create_leave_request(
         )
 
     row = LeaveRequest(
-        staff_id=me.id,
+        staff_id=str(me.id),
         leave_type=payload.leave_type,
         start_date=payload.start_date,
         end_date=payload.end_date,
@@ -513,7 +525,8 @@ async def decide_leave_request(
     business_id = await resolve_business_id(db, user)
 
     staff_ids = {
-        s.id for s in await db.scalars(select(Staff).where(Staff.business_id == business_id))
+        str(s.id)
+        for s in await db.scalars(select(Staff).where(Staff.business_id == business_id))
     }
     row = await db.scalar(
         select(LeaveRequest).where(LeaveRequest.id == leave_id)

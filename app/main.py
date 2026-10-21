@@ -3,10 +3,11 @@
 All API groups (A–I) from Doc 10 register their routers here.
 """
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
+from app.core.deps import require_active_business
 from app.core.tenancy import TenantIsolationMiddleware
 
 app = FastAPI(
@@ -29,6 +30,7 @@ app.add_middleware(TenantIsolationMiddleware)
 # ── API groups (Doc 10) ────────────────────────────────────────────────────
 from app.auth.router import router as auth_router  # A1–A7
 from app.business.router import router as business_router  # B1–B6
+from app.onboarding.router import router as onboarding_router  # onboarding status
 from app.customers.router import router as customers_router  # C1–C5
 from app.appointments.router import router as appointments_router  # D1–D8
 from app.queue.router import router as queue_router
@@ -48,12 +50,18 @@ from app.booking.discovery import router as discovery_router  # CU4 "near me" se
 from app.commission.router import router as commission_router  # E2–E4
 from app.admin.router import router as admin_router
 
-for router in (
-    auth_router,
-    business_router,
+# ── Subscription-gated routers (T004-12) ──────────────────────────────
+# Every endpoint in these routers is authenticated and business-scoped,
+# so the guard is applied once at registration: an `expired` tenant
+# answers 402 (payment fixes it) and a `suspended` one 403 (it does
+# not). The subscription router is deliberately excluded — an expired
+# business must still reach `POST /v1/subscription/pay` to recover —
+# as are auth, onboarding, business, the public booking portal and
+# platform admin. Routers that mix public and private endpoints
+# (queue, messaging, media) apply the guard per-endpoint instead.
+_GATED_ROUTERS = (
     customers_router,
     appointments_router,
-    queue_router,
     chairs_router,
     staff_router,
     commission_router,
@@ -62,15 +70,31 @@ for router in (
     reports_router,
     inventory_router,
     loyalty_router,
+    ai_studio_router,
+)
+
+_UNGATED_ROUTERS = (
+    auth_router,
+    business_router,
+    onboarding_router,
+    queue_router,
     subscriptions_router,
     messaging_router,
-    ai_studio_router,
     media_router,
     public_booking_router,
     discovery_router,
     admin_router,
-):
+)
+
+for router in _UNGATED_ROUTERS:
     app.include_router(router, prefix="/v1")
+
+for router in _GATED_ROUTERS:
+    app.include_router(
+        router,
+        prefix="/v1",
+        dependencies=[Depends(require_active_business)],
+    )
 
 
 @app.get("/health")

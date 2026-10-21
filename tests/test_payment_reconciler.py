@@ -86,18 +86,23 @@ class _FakeSession:
 
     def __init__(self, events, payment, sub, plan=None):
         self._events = list(events)
-        # Results queue in call order: Payment (reconcile), then Subscription and
-        # Plan (inside _apply_payment). An earlier version switched on a `_next`
-        # flag it never set, so every later lookup returned the Payment again and
-        # blew up on `sub.plan_id`. A plain queue cannot have that failure mode.
+        # Results queue in call order: the Payment lookup in `_reconcile`
+        # (by AccountReference), then — inside `_apply_payment` — the locked
+        # Payment re-fetch (`SELECT ... FOR UPDATE`), the Subscription, the
+        # Plan, and the Business mirror lookup. An earlier version switched
+        # on a `_next` flag it never set, so every later lookup returned the
+        # Payment again and blew up on `sub.plan_id`. A plain queue cannot
+        # have that failure mode.
         #
         # `payment` may be None, which is how the "no payment matches this
         # reference" branch is reached: a queue of [None, ...] simply returns
         # None from the first lookup, exactly as a real miss would.
         self._scalar_results = [
             payment,
+            payment,  # _apply_payment's locked re-fetch
             sub,
             plan or Plan(id="plan_monthly", interval_days=30, price_kes=1000),
+            None,  # Business mirror: no row, nothing to sync
         ]
         self.committed = False
 

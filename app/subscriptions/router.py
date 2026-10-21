@@ -21,12 +21,14 @@ store first, then decide, and never trust a callback to be well-formed,
 well-signed, or even new.
 """
 
+import math
 from datetime import datetime, timedelta
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
 from app.core.database import get_db
@@ -43,6 +45,7 @@ from app.core.tenancy import resolve_business_id
 from app.models.billing import Payment, Plan, Subscription
 from app.models.identity import User
 from app.models.platform import WebhookEvent
+from app.models.tenant import Business
 from app.subscriptions.schemas import (
     PaymentResponse,
     PlanResponse,
@@ -76,7 +79,10 @@ def _plan_out(p: Plan) -> PlanResponse:
 def _payment_out(p: Payment) -> PaymentResponse:
     return PaymentResponse(
         id=str(p.id),
-        subscription_id=p.subscription_id,
+        # The column is a UUID; the API contract is a string.
+        # Reading it back as the raw UUID object fails response
+        # validation — the same class of bug as writing one.
+        subscription_id=str(p.subscription_id),
         amount_kes=p.amount_kes,
         method=p.method,
         provider=p.provider,
@@ -102,6 +108,18 @@ async def _current_subscription(
     )
 
 
+async def _current_or_expired_subscription(
+    db: AsyncSession, business_id: str
+) -> Optional[Subscription]:
+    """The live subscription or the most recent expired one (for re-subscription)."""
+    return await db.scalar(
+        select(Subscription)
+        .where(Subscription.business_id == business_id)
+        .order_by(Subscription.created_at.desc())
+        .limit(1)
+    )
+
+
 def _subscription_out(
     sub: Subscription, plan_code: Optional[str], now: datetime
 ) -> SubscriptionDetailResponse:
@@ -109,8 +127,18 @@ def _subscription_out(
 
     Storing "days remaining" would mean a background job has to be exactly on time
     every day; deriving it means the banner is right even if the worker was down.
+
+    The countdown rounds *up* while there is time left. A ten-day trial granted
+    at 09:00 ends at 09:00 ten days later, so in between there are nine whole
+    days and most of a tenth — and "nine days left" is a day short of what the
+    owner was promised, on the very screen that promises it. Once the period has
+    passed it rounds *down*, so the number keeps its sign: a period that ended
+    yesterday still reads as expired rather than as "zero days left".
     """
-    trial_left = (sub.current_period_end - now).days
+    remaining_days = (sub.current_period_end - now).total_seconds() / 86400.0
+    trial_left = (
+        math.ceil(remaining_days) if remaining_days > 0 else math.floor(remaining_days)
+    )
     renewal_in = trial_left if sub.status in ("trial", "active") else 0
     return SubscriptionDetailResponse(
         id=str(sub.id),
@@ -146,18 +174,32 @@ async def _apply_payment(db: AsyncSession, payment: Payment) -> None:
       receive a paid month. Whitelisting `pending` means an explicit
       `_apply_payment` call is required for time to be granted, and forgetting to
       call it fails closed.
+
+    - Uses SELECT ... FOR UPDATE to prevent concurrent callbacks from both
+      applying the same payment (double extension).
     """
     if payment.status != "pending":
         return  # already applied, or never payable
 
     now = now_utc()
+
+    # Lock the payment row to prevent concurrent application.
+    # We re-fetch the payment with FOR UPDATE to serialize concurrent callbacks.
+    locked_payment = await db.scalar(
+        select(Payment)
+        .where(Payment.id == payment.id)
+        .with_for_update()
+    )
+    if not locked_payment or locked_payment.status != "pending":
+        return  # already applied, or never payable
+
     sub = await db.scalar(
-        select(Subscription).where(Subscription.id == payment.subscription_id)
+        select(Subscription).where(Subscription.id == locked_payment.subscription_id)
     )
     if not sub:
         # The payment is real but the subscription is gone (business deleted).
         # Record the money; there is nothing to extend.
-        payment.status = "failed"
+        locked_payment.status = "failed"
         return
 
     plan = await db.scalar(select(Plan).where(Plan.id == sub.plan_id))
@@ -171,8 +213,21 @@ async def _apply_payment(db: AsyncSession, payment: Payment) -> None:
     sub.current_period_start = period_start
     sub.current_period_end = period_start + timedelta(days=period_days)
 
-    payment.status = "success"
-    payment.paid_at = now
+    # Keep the `businesses.status` mirror in step. The lifecycle worker
+    # only ever *downgrades* that column (trial → grace → expired);
+    # payment is the one event that upgrades it, and it happens here —
+    # the single writer of subscription state — so a paying customer is
+    # never left marked `trialing` or `grace`. A business support
+    # suspended stays suspended: payment does not override a deliberate
+    # support decision, the same rule the worker applies in reverse.
+    biz = await db.scalar(
+        select(Business).where(Business.id == sub.business_id)
+    )
+    if biz is not None and biz.status != "suspended":
+        biz.status = "active"
+
+    locked_payment.status = "success"
+    locked_payment.paid_at = now
     await db.flush()
 
 
@@ -236,7 +291,33 @@ async def start_payment(
     that M-Pesa was down".
     """
     business_id = await resolve_business_id(db, user)
-    sub = await _current_subscription(db, business_id)
+
+    # First, check for an existing pending payment for this business+plan+method
+    # to prevent double-tap creating multiple STK pushes.
+    existing_pending = await db.scalar(
+        select(Payment)
+        .where(
+            Payment.business_id == business_id,
+            Payment.status == "pending",
+        )
+        .order_by(Payment.created_at.desc())
+        .limit(1)
+    )
+    if existing_pending:
+        # Return the existing pending payment instead of creating a new one.
+        if existing_pending.method == "mpesa":
+            return StartPaymentResponse(
+                payment_id=str(existing_pending.id),
+                state="awaiting_mpesa",
+                instructions="Check your phone for the M-Pesa prompt and enter your PIN.",
+            )
+        else:
+            # For Pesapal, we need to return a checkout URL. Since we don't store it,
+            # we'll create a new payment but this is an edge case.
+            pass
+
+    # Allow re-subscription from expired: look for any subscription (including expired)
+    sub = await _current_or_expired_subscription(db, business_id)
     if not sub:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="No subscription yet"
@@ -261,7 +342,7 @@ async def start_payment(
     provider = "daraja" if payload.method == "mpesa" else "pesapal"
     payment = Payment(
         business_id=business_id,
-        subscription_id=sub.id,
+        subscription_id=str(sub.id),
         amount_kes=plan.price_kes,
         method=payload.method,
         provider=provider,
@@ -405,6 +486,12 @@ async def daraja_webhook(request: Request, db: Db) -> WebhookAck:
     if not payment:
         return WebhookAck(received=True, event_id=str(event.id))
 
+    # CRITICAL: Verify that the CheckoutRequestID matches the one we stored at initiation.
+    # This is the only authentication for unsigned Daraja callbacks.
+    if payment.provider_ref and event_ref != payment.provider_ref:
+        # Mismatched CheckoutRequestID — this callback is not for our payment.
+        return WebhookAck(received=True, event_id=str(event.id))
+
     # A success callback that quotes a different amount is not our success.
     quoted = stk.get("Amount") or payload.get("Amount")
     if succeeded and quoted is not None and int(quoted) != payment.amount_kes:
@@ -425,7 +512,17 @@ async def daraja_webhook(request: Request, db: Db) -> WebhookAck:
         # guard and extended the subscription anyway, flipping the payment back
         # to success. A barber could cancel at the PIN prompt and still get a
         # month. Only a success callback may extend time.
-        payment.status = "failed"
+        #
+        # IMPORTANT: Do not flip a payment that is already `success` to `failed`.
+        # A late failure callback after a success is a reversal — it must not
+        # silently claw back granted subscription time. Reversals require a
+        # separate handling path (refunded status, manual review).
+        if payment.status == "success":
+            # Already applied; log the reversal attempt but don't downgrade.
+            # In production, this should trigger an alert for manual review.
+            pass
+        else:
+            payment.status = "failed"
     else:
         await _apply_payment(db, payment)
 
@@ -484,9 +581,16 @@ async def pesapal_webhook(request: Request, db: Db) -> WebhookAck:
         return WebhookAck(received=True, event_id=str(event.id))
 
     payment.raw_callback = payload
-    payment.provider_ref = str(
-        details.get("merchant_reference") or payment.provider_ref or ""
+    # Store Pesapal's transaction reference (payment_reference or tracking_account_reference)
+    # instead of our merchant_reference, for proper audit trail.
+    pesapal_txn_ref = (
+        details.get("payment_reference")
+        or details.get("tracking_account_reference")
+        or details.get("merchant_reference")
+        or payment.provider_ref
+        or ""
     )
+    payment.provider_ref = str(pesapal_txn_ref)
 
     if status_value == "completed":
         quoted = details.get("amount")
@@ -497,7 +601,14 @@ async def pesapal_webhook(request: Request, db: Db) -> WebhookAck:
         else:
             await _apply_payment(db, payment)
     else:
-        payment.status = "failed"
+        # Do not flip a payment that is already `success` to `failed`.
+        # A late failure callback after a success is a reversal — it must not
+        # silently claw back granted subscription time.
+        if payment.status == "success":
+            # Already applied; log the reversal attempt but don't downgrade.
+            pass
+        else:
+            payment.status = "failed"
 
     event.processed_at = now_utc()
     await db.flush()

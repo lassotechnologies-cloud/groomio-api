@@ -20,7 +20,7 @@ from app.models.money import Expense, Sale
 from app.models.operations import Appointment
 from app.models.people import Customer
 from app.models.tenant import Business
-from app.workers.db import run_async, session_scope
+from app.workers.db import beat_task, run_async, session_scope
 from app.workers.notifications import notify_once
 
 
@@ -28,6 +28,7 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+@beat_task("daily-report")
 async def _compute() -> dict:
     # Yesterday in UTC. The shop's own timezone is a per-business field we do not
     # yet model, so UTC is used consistently rather than half-right per shop.

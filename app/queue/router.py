@@ -13,7 +13,8 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import cast, func, select
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.appointments.schemas import (
@@ -22,7 +23,12 @@ from app.appointments.schemas import (
     QueueEntryResponse,
 )
 from app.core.database import get_db
-from app.core.deps import CurrentUser, require_role
+from app.core.deps import (
+    CurrentUser,
+    require_active_business,
+    require_role,
+)
+from app.core.phone import normalize_phone
 from app.core.security import now_utc
 from app.models.operations import Chair, QueueEntry
 from app.models.people import Customer, Staff
@@ -33,6 +39,10 @@ router = APIRouter(tags=["queue"])
 Db = Annotated[AsyncSession, Depends(get_db)]
 QueueRoles = Depends(require_role("owner", "clerk", "barber"))
 ClerkRoles = Depends(require_role("owner", "clerk"))
+# This router mixes the public queue-position read with staff-only
+# writes, so the subscription guard (T004-12) is applied per
+# endpoint rather than at the router level.
+ActiveBusiness = Depends(require_active_business)
 
 # Fallback service length when a walk-in gives no services (a quick trim).
 DEFAULT_SERVICE_MIN = 30
@@ -123,7 +133,9 @@ async def _load_entry(db: AsyncSession, business_id: str, entry_id: str) -> Queu
     """Scope by branch's business so a queue id from another shop is a 404."""
     entry = await db.scalar(
         select(QueueEntry)
-        .join(Branch, Branch.id == QueueEntry.branch_id)
+        # `queue_entries.branch_id` is VARCHAR and `branches.id` is UUID, so the
+        # join needs an explicit cast or PostgreSQL rejects the operator.
+        .join(Branch, Branch.id == cast(QueueEntry.branch_id, UUID))
         .where(QueueEntry.id == entry_id, Branch.business_id == business_id)
     )
     if not entry:
@@ -140,7 +152,9 @@ async def _serialize(
     names: dict[str, str] = {}
     cust_ids = {e.customer_id for e in entries}
     for c in await db.scalars(select(Customer).where(Customer.id.in_(cust_ids))):
-        names[c.id] = c.full_name
+        # `queue_entries.customer_id` reads back as text; key the map the same
+        # way or every waiting customer is listed without a name.
+        names[str(c.id)] = c.full_name
 
     return [
         QueueEntryResponse(
@@ -164,7 +178,7 @@ async def _serialize(
 @router.get(
     "/branches/{branch_id}/queue",
     response_model=list[QueueEntryResponse],
-    dependencies=[QueueRoles],
+    dependencies=[QueueRoles, ActiveBusiness],
 )
 async def get_queue(
     branch_id: str, db: Db, user: CurrentUser
@@ -189,7 +203,7 @@ async def get_queue(
     "/branches/{branch_id}/queue",
     response_model=QueueEntryResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[ClerkRoles],
+    dependencies=[ClerkRoles, ActiveBusiness],
 )
 async def join_queue(
     branch_id: str, payload: QueueEntryCreateRequest, db: Db, user: CurrentUser
@@ -211,7 +225,7 @@ async def join_queue(
     existing = await db.scalar(
         select(QueueEntry).where(
             QueueEntry.branch_id == branch_id,
-            QueueEntry.customer_id == customer.id,
+            QueueEntry.customer_id == str(customer.id),
             QueueEntry.status.in_(("waiting", "serving")),
         )
     )
@@ -223,7 +237,7 @@ async def join_queue(
 
     entry = QueueEntry(
         branch_id=branch_id,
-        customer_id=customer.id,
+        customer_id=str(customer.id),
         queue_number=await _next_queue_number(db, branch_id),
         status="waiting",
         joined_at=now_utc(),
@@ -240,7 +254,7 @@ async def join_queue(
 @router.post(
     "/queue-entries/{entry_id}/serve",
     response_model=QueueEntryResponse,
-    dependencies=[ClerkRoles],
+    dependencies=[ClerkRoles, ActiveBusiness],
 )
 async def serve_next(entry_id: str, db: Db, user: CurrentUser) -> QueueEntryResponse:
     """Call someone forward: waiting -> serving, and free up a chair."""
@@ -263,7 +277,8 @@ async def serve_next(entry_id: str, db: Db, user: CurrentUser) -> QueueEntryResp
     )
     if chair:
         chair.status = "occupied"
-        entry.chair_id = chair.id
+        # `queue_entries.chair_id` is VARCHAR; `Chair.id` is a UUID.
+        entry.chair_id = str(chair.id)
 
     await _refresh_estimates(db, entry.branch_id)
     return (await _serialize(db, [entry]))[0]
@@ -272,7 +287,7 @@ async def serve_next(entry_id: str, db: Db, user: CurrentUser) -> QueueEntryResp
 @router.post(
     "/queue-entries/{entry_id}/complete",
     response_model=QueueEntryResponse,
-    dependencies=[ClerkRoles],
+    dependencies=[ClerkRoles, ActiveBusiness],
 )
 async def complete_entry(
     entry_id: str, db: Db, user: CurrentUser
@@ -336,18 +351,22 @@ async def public_queue_position(
     if not branch:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
 
-    digits = "".join(ch for ch in customer_ref if ch.isdigit())
-    if not digits:
+    # `customers.phone` is stored in the one canonical E.274 form the rest of the
+    # app writes, so the lookup key has to be normalised the same way. The
+    # previous local-prefix handling left "0711000111" as "+0711000111", which
+    # matches no stored row: a customer who typed the local number they booked
+    # with was told they were not in the queue.
+    normalized = normalize_phone(customer_ref)
+    if normalized == "+":
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="phone required"
         )
-    normalized = f"+{digits}" if not digits.startswith("254") else f"+{digits}"
 
     entry = await db.scalar(
         select(QueueEntry)
-        .join(Customer, Customer.id == QueueEntry.customer_id)
+        .join(Customer, Customer.id == cast(QueueEntry.customer_id, UUID))
         .where(
-            QueueEntry.branch_id == branch.id,
+            QueueEntry.branch_id == str(branch.id),
             Customer.phone == normalized,
             QueueEntry.status.in_(("waiting", "serving")),
         )
@@ -364,7 +383,7 @@ async def public_queue_position(
         select(func.count())
         .select_from(QueueEntry)
         .where(
-            QueueEntry.branch_id == branch.id,
+            QueueEntry.branch_id == str(branch.id),
             QueueEntry.status == "waiting",
             QueueEntry.queue_number < entry.queue_number,
         )

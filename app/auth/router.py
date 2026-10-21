@@ -1,18 +1,27 @@
 """Authentication routes — API group A (Doc 10.2: A1–A7).
 
 Signup flow (Phase 1):
-  1. `POST /v1/auth/register`     — creates a `pending` user, no business yet
+  1. `POST /v1/auth/register`     — creates a **pending** user. Returns NO
+                                   access/refresh token, only a restricted
+                                   `onboarding_token` (no role, no tenant).
   2. `POST /v1/auth/otp/request`  — generates a 6-digit code, stores the HASH
-  3. `POST /v1/auth/otp/verify`   — verifies, flips user to `active`, mints an
-                                   onboarding token that unlocks step B1 (business)
+  3. `POST /v1/auth/otp/verify`   — verifies, flips user to `active`, issues
+                                   access + refresh tokens
   4. `POST /v1/auth/login`        — password login -> access + refresh tokens
+                                   (403 while the account is still pending)
   5. `POST /v1/auth/refresh`      — rotates the refresh token
+
+Account lifecycle: `pending` -> `active` -> (`suspended`). A session is only
+ever issued to an `active` account.
 
 Security rules enforced here (Doc 11.1):
 - OTPs are generated with `secrets`, stored as SHA-256 hashes, expire in 10
   minutes, and burn after 5 wrong attempts.
 - Passwords are argon2id; plain text is never stored or logged.
 - Refresh tokens are persisted hashed so they can be revoked server-side.
+- Registration hardcodes `role="owner"`; a client-supplied role is dropped, so
+  signup cannot mint a privileged account.
+- Phone and email are canonicalised before they are stored or compared.
 """
 
 from datetime import timedelta
@@ -20,6 +29,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.schemas import (
@@ -108,6 +118,27 @@ async def _issue_tokens(db: AsyncSession, user: User) -> tuple[str, str]:
     return access, refresh
 
 
+def _issue_onboarding_token(user: User) -> str:
+    """A deliberately restricted token for an account that has not verified yet.
+
+    It carries **no `role` and no `business_id`**. That is the whole point:
+    `require_role` reads `role` off the token, so an absent role fails the check
+    and no business endpoint will accept this credential. `get_current_user`
+    rejects it outright as well, because its type is `"onboarding"` and not
+    `"access"`. Nothing here is a session — it only names the pending user for
+    the verification step.
+    """
+    return create_access_token(
+        str(user.id),
+        {
+            "type": "onboarding",
+            "email": user.email,
+            "status": user.status,
+            "verified": user.status == "active",
+        },
+    )
+
+
 # ── A1 — register ────────────────────────────────────────────────────────────
 @router.post(
     "/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED
@@ -115,7 +146,18 @@ async def _issue_tokens(db: AsyncSession, user: User) -> tuple[str, str]:
 async def register(
     payload: RegisterRequest, db: AsyncSession = Depends(get_db)
 ) -> RegisterResponse:
-    """Create the user shell. No business yet — that happens after OTP (B1)."""
+    """Create a **pending** account. No session is issued here.
+
+    Registration deliberately returns no access token and no refresh token.
+    Minting a session at signup means anybody can register a phone number or
+    email they do not control and walk away with an authenticated identity —
+    including one that can claim ownership of an existing shop's phone number.
+
+    The account is created `pending`; `POST /auth/otp/verify` flips it to
+    `active` and issues the real access + refresh pair. Until then the only
+    credential returned is the restricted `onboarding_token`, which carries no
+    role and opens no business endpoint.
+    """
     existing = await db.scalar(
         select(User).where(
             (User.phone == payload.phone) | (User.email == payload.email)
@@ -127,18 +169,37 @@ async def register(
             detail="Phone or email already registered",
         )
 
+    # `role` is hardcoded, never read from the payload: a client that posts
+    # `{"role": "super_admin"}` gets it dropped by pydantic's default
+    # `extra="ignore"`, so registration cannot mint an elevated account.
     user = User(
         full_name=payload.full_name,
         phone=payload.phone,
         email=payload.email,
         password_hash=hash_password(payload.password),
         role="owner",
-        status="active",
+        status="pending",
     )
     db.add(user)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # Two concurrent registrations can both clear the SELECT above and then
+        # collide on the unique index. The loser must get the same 409 as any
+        # other duplicate, never a 500.
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Phone or email already registered",
+        )
 
-    return RegisterResponse(user_id=str(user.id), next="done")
+    return RegisterResponse(
+        user_id=str(user.id),
+        next="otp_verify",
+        requires_verification=True,
+        onboarding_token=_issue_onboarding_token(user),
+        user=_serialize_user(user),
+    )
 
 
 # ── A2 — request OTP ─────────────────────────────────────────────────────────
@@ -286,10 +347,23 @@ async def verify_otp(
     record.consumed_at = now_utc()
     user.status = "active"
 
-    onboarding_token = create_access_token(
-        str(user.id), {**_user_claims(user), "type": "onboarding"}
+    # The token used to be minted as
+    #     create_access_token(uid, {**claims, "type": "onboarding"})
+    # but `create_access_token` already sets `type: "access"`, and the extra
+    # claim silently overwrote it. `get_current_user` rejects anything whose
+    # `type` is not `"access"`, so the onboarding token this endpoint returned
+    # failed with 401 against every protected route — a token that authenticated
+    # nothing. It is now issued by the shared `_issue_tokens` helper, which
+    # yields a genuine access token plus a persisted refresh token, matching how
+    # `/auth/login` and `/auth/otp/login/verify` behave.
+    access, refresh = await _issue_tokens(db, user)
+    return OTPVerifyResponse(
+        verified=True,
+        onboarding_token=access,
+        access_token=access,
+        refresh_token=refresh,
+        user=_serialize_user(user),
     )
-    return OTPVerifyResponse(verified=True, onboarding_token=onboarding_token)
 
 
 # ── A3b — request OTP for login ──────────────────────────────────
@@ -391,6 +465,14 @@ async def verify_otp_login(
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
 
+    # A suspended account must not be able to mint a session through the OTP
+    # door when the password door refuses it. `get_user`-style lookups below
+    # already check status; this path did not.
+    if user.status == "suspended":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Account suspended"
+        )
+
     record = await db.scalar(
         select(OTPCode)
         .where(
@@ -427,6 +509,12 @@ async def verify_otp_login(
 
     record.consumed_at = now_utc()
 
+    # Receiving a login code *is* proof that the caller controls the registered
+    # contact, so a pending account is promoted here rather than left stranded.
+    # A suspended account is never promoted.
+    if user.status == "pending":
+        user.status = "active"
+
     access, refresh = await _issue_tokens(db, user)
     return OtpLoginResponse(
         access_token=access, refresh_token=refresh, user=_serialize_user(user)
@@ -449,6 +537,14 @@ async def login(
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
+        )
+    # A pending account has the right password but has not proven it controls the
+    # registered contact yet. Issuing a session here is the takeover hole: the
+    # password is chosen by whoever registered the number, not by its owner.
+    if user.status == "pending":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account verification required",
         )
     if user.status == "suspended":
         raise HTTPException(
@@ -504,7 +600,8 @@ async def refresh(
         )
     )
     return RefreshResponse(
-        access_token=create_access_token(str(user.id), _user_claims(user))
+        access_token=create_access_token(str(user.id), _user_claims(user)),
+        refresh_token=new_refresh,
     )
 
 

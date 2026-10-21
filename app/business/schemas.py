@@ -3,13 +3,28 @@
 from datetime import time
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 BusinessType = Literal["barber_shop", "salon", "nail_bar", "beauty_clinic", "spa"]
 
 
 # ── B1 — create business + first branch (onboarding screen 2) ───────────────
 class BusinessCreateRequest(BaseModel):
+    """The whole of onboarding step 2, in a single call.
+
+    `extra="ignore"` is stated rather than inherited. Ownership is derived from
+    the caller's token, so a client that posts `owner_user_id` or `business_id`
+    must have those keys dropped silently instead of bound to a model attribute
+    that something might later read. Rejecting them with a 422 would be louder,
+    but it would also fail an otherwise-valid submission: the field was never
+    the client's to set, and an error naming it advertises a rule the API has
+    no need to teach.
+
+    Every field below already has a column. This task required no migration.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
     name: str = Field(..., min_length=2, max_length=160)
     business_type: BusinessType
     county: Optional[str] = Field(None, max_length=80)
@@ -23,6 +38,36 @@ class BusinessCreateRequest(BaseModel):
     opens_at: Optional[time] = None
     closes_at: Optional[time] = None
     num_chairs: int = Field(1, ge=1, le=200)
+
+    # Street address and public contact for the first branch. Both columns have
+    # existed on `branches` since migration 0007 and the public booking portal
+    # already renders them, but they were unreachable from this payload — an
+    # owner had no way to publish the number a customer calls when they cannot
+    # find the shop. Optional: a shop reachable only by its own booking link
+    # needs neither, and discovery skips branches with no coordinates anyway.
+    branch_address: Optional[str] = Field(None, max_length=200)
+    # Stored as typed, deliberately not run through `normalize_phone`. That
+    # helper is Kenyan-mobile-specific by design and rewrites a landline
+    # ("020 123 4567") into something that dials the wrong number. A shop's
+    # public line is very often a landline, and it is shown to a customer
+    # rather than texted, so canonicalising it would corrupt it.
+    branch_phone: Optional[str] = Field(None, max_length=20)
+
+    @field_validator("branch_address", "branch_phone", mode="before")
+    @classmethod
+    def _blank_to_none(cls, v):
+        """Treat an empty form field as "not supplied".
+
+        An HTML form submits `""` for a field the owner left untouched, which is
+        not the same as omitting the key. Without this the branch stores `""`
+        and the public booking page renders an empty address line instead of
+        hiding it, and `""` is a value every "is this set?" check has to learn
+        to reject.
+        """
+        if isinstance(v, str):
+            stripped = v.strip()
+            return stripped or None
+        return v
 
 
 class BranchResponse(BaseModel):

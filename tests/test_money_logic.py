@@ -162,7 +162,8 @@ def _sign(
     import base64
     import hashlib
 
-    payload = f"{notification_type}{notification_id}{details}{merchant_id}"
+    # Pesapal joins the four fields with single spaces (T004-03).
+    payload = f"{notification_type} {notification_id} {details} {merchant_id}"
     return base64.b64encode(hashlib.sha512(payload.encode()).digest()).decode()
 
 

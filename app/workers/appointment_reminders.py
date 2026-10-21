@@ -15,7 +15,7 @@ from sqlalchemy import select
 
 from app.models.operations import Appointment
 from app.models.people import Customer
-from app.workers.db import run_async, session_scope
+from app.workers.db import beat_task, run_async, session_scope
 from app.workers.notifications import notify_once
 
 # How far ahead to remind. One hour is long enough to be useful and short enough
@@ -28,6 +28,7 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+@beat_task("appointment-reminders")
 async def _remind() -> dict:
     now = _now()
     start = now + timedelta(minutes=REMINDER_WINDOW_MIN - REMINDER_INTERVAL_MIN)
@@ -49,6 +50,9 @@ async def _remind() -> dict:
         )
 
         for appointment in appointments:
+            # `customers.id` is a UUID and `appointments.customer_id` is VARCHAR,
+            # read back as text. Comparing them is fine (the bind is coerced);
+            # what must not happen is handing `customer.id` straight on below.
             customer = await db.scalar(
                 select(Customer).where(Customer.id == appointment.customer_id)
             )
@@ -66,7 +70,8 @@ async def _remind() -> dict:
                     f"Hi {customer.full_name.split()[0]}, your appointment is in "
                     f"about {minutes} minutes."
                 ),
-                customer_id=customer.id,
+                # `notifications.recipient_customer_id` is VARCHAR.
+                customer_id=str(customer.id),
             )
             if created:
                 sent += 1

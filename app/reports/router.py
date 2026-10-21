@@ -14,7 +14,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import cast, func, select
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -38,8 +39,11 @@ OwnerOnly = Depends(require_role("owner"))
 
 
 async def _branch_ids(db: AsyncSession, business_id: str) -> list[str]:
+    # `Branch.id` is a UUID and every column this list is compared against
+    # (`sales.branch_id`, `expenses.branch_id`) is VARCHAR, so the ids are
+    # rendered as text here rather than at each call site.
     return [
-        b.id
+        str(b.id)
         for b in await db.scalars(
             select(Branch).where(Branch.business_id == business_id)
         )
@@ -81,7 +85,9 @@ async def _barber_performance(
             func.coalesce(func.sum(SaleItem.commission_kes), 0),
         )
         .select_from(SaleItem)
-        .join(Sale, Sale.id == SaleItem.sale_id)
+        # `sale_items.sale_id` is VARCHAR and `sales.id` is UUID; PostgreSQL has
+        # no `uuid = varchar` operator, so the join needs an explicit cast.
+        .join(Sale, Sale.id == cast(SaleItem.sale_id, UUID))
         .where(
             Sale.branch_id.in_(branch_ids),
             Sale.created_at >= start,
@@ -99,7 +105,8 @@ async def _barber_performance(
 
     stmt = (
         select(Staff.id, User.full_name)
-        .join(User, User.id == Staff.user_id)
+        # `staff.user_id` is VARCHAR and `users.id` is UUID; explicit cast.
+        .join(User, User.id == cast(Staff.user_id, UUID))
         .where(Staff.id.in_(staff_ids))
     )
     names = {str(sid): name for sid, name in (await db.execute(stmt)).all()}
@@ -317,7 +324,7 @@ async def compare_branches(
                     func.coalesce(func.sum(Sale.total_kes), 0),
                     func.count(Sale.id),
                 ).where(
-                    Sale.branch_id == branch.id,
+                    Sale.branch_id == str(branch.id),
                     Sale.created_at >= start,
                     Sale.created_at < end,
                 )
@@ -326,7 +333,7 @@ async def compare_branches(
 
         expenses = await db.scalar(
             select(func.coalesce(func.sum(Expense.amount_kes), 0)).where(
-                Expense.branch_id == branch.id,
+                Expense.branch_id == str(branch.id),
                 Expense.incurred_at >= from_date,
                 Expense.incurred_at < to_date,
             )
@@ -335,7 +342,9 @@ async def compare_branches(
         rev, exp = int(revenue or 0), int(expenses or 0)
         out.append(
             BranchComparison(
-                branch_id=branch.id,
+                # `BranchComparison.branch_id` is a `str`; a raw UUID key would
+                # fail response validation rather than degrade quietly.
+                branch_id=str(branch.id),
                 branch_name=branch.name,
                 sales_count=int(count or 0),
                 revenue_kes=rev,

@@ -18,7 +18,7 @@ from sqlalchemy import select
 
 from app.core.config import settings
 from app.models.messaging import MessageThread
-from app.workers.db import run_async, session_scope
+from app.workers.db import beat_task, run_async, session_scope
 
 # Threads are archived in batches so one run cannot hold a long transaction open
 # over a large backlog and time out against the pooler.
@@ -29,6 +29,7 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+@beat_task("chat-retention-cleanup")
 async def _archive() -> dict:
     cutoff = _now() - timedelta(days=settings.chat_retention_months * 30)
 

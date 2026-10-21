@@ -68,5 +68,9 @@ celery_app.conf.update(
             "task": "app.workers.payment_reconciler.reconcile_webhooks",
             "schedule": 300.0,  # every 5 min
         },
+        "payment-timeout": {
+            "task": "app.workers.payment_reconciler.timeout_pending_payments",
+            "schedule": 3600.0,  # hourly
+        },
     },
 )

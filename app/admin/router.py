@@ -91,6 +91,31 @@ async def trial_extend(
     if biz.status == "expired":
         biz.status = "trialing"
 
+    # The billing machine keys off `subscriptions.current_period_end`, never
+    # off `businesses.trial_ends_at` — the lifecycle worker does not read the
+    # latter. Extending only the business column would be a no-op the owner
+    # never sees, so the live trial subscription is extended by the same
+    # number of days, from the same anchor.
+    sub_before = None
+    sub = await db.scalar(
+        select(Subscription).where(
+            # `business_id` is a VARCHAR column; `biz.id` is a UUID
+            # object, and asyncpg rejects a UUID for a text parameter.
+            Subscription.business_id == str(biz.id),
+            Subscription.status == "trial",
+        )
+    )
+    if sub is not None:
+        sub_before = (
+            sub.current_period_end.isoformat()
+            if sub.current_period_end
+            else None
+        )
+        sub_anchor = sub.current_period_end or now_utc()
+        if sub_anchor < now_utc():
+            sub_anchor = now_utc()
+        sub.current_period_end = sub_anchor + timedelta(days=payload.days)
+
     _audit(
         db,
         actor_user_id=user["user_id"],
@@ -103,6 +128,12 @@ async def trial_extend(
             "status": biz.status,
             "days": payload.days,
             "reason": payload.reason,
+            "subscription_period_end": (
+                sub.current_period_end.isoformat()
+                if sub is not None and sub.current_period_end
+                else None
+            ),
+            "subscription_period_end_before": sub_before,
         },
     )
     await db.flush()

@@ -20,10 +20,11 @@ from datetime import datetime, timedelta, timezone
 from celery import shared_task
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.models.billing import Payment
 from app.models.platform import WebhookEvent
 from app.subscriptions.router import _apply_payment
-from app.workers.db import run_async, session_scope
+from app.workers.db import beat_task, run_async, session_scope
 
 # Anything older than this is left alone. A month-old unprocessed event is a bug
 # to investigate, not something to silently apply 30 days late.
@@ -43,6 +44,7 @@ def _pesapal_succeeded(payload: dict) -> bool:
     return str(details.get("status", "")).lower() == "completed"
 
 
+@beat_task("payment-reconciler")
 async def _reconcile() -> dict:
     now = _now()
     floor = now - timedelta(days=RECONCILE_WINDOW_DAYS)
@@ -69,10 +71,14 @@ async def _reconcile() -> dict:
                 succeeded = _daraja_succeeded(payload)
                 stk = (payload.get("Body") or {}).get("stkCallback") or payload
                 reference = stk.get("AccountReference")
+                event_ref = stk.get("CheckoutRequestID") or payload.get("CheckoutRequestID")
+                quoted_amount = stk.get("Amount") or payload.get("Amount")
             else:
                 succeeded = _pesapal_succeeded(payload)
                 details = payload.get("notification_details") or {}
                 reference = details.get("merchant_reference")
+                event_ref = details.get("payment_reference") or details.get("tracking_account_reference")
+                quoted_amount = details.get("amount")
 
             payment = None
             if reference:
@@ -86,6 +92,25 @@ async def _reconcile() -> dict:
                 # business, and applying it would be guessing.
                 skipped += 1
                 continue
+
+            # Re-verify amount and provider_ref (CheckoutRequestID for Daraja)
+            # to prevent forged or mismatched stored events from being applied.
+            if event.source == "daraja":
+                if payment.provider_ref and event_ref != payment.provider_ref:
+                    # Mismatched CheckoutRequestID — this stored event is not for our payment.
+                    skipped += 1
+                    continue
+                if quoted_amount is not None and int(quoted_amount) != payment.amount_kes:
+                    # Amount mismatch — mark as failed and stop retrying.
+                    payment.status = "failed"
+                    event.processed_at = now
+                    continue
+            else:
+                # Pesapal: verify amount if present
+                if quoted_amount is not None and int(float(quoted_amount)) != payment.amount_kes:
+                    payment.status = "failed"
+                    event.processed_at = now
+                    continue
 
             if not succeeded:
                 # The provider told us it failed. Record that and stop retrying —
@@ -123,5 +148,51 @@ def reconcile_webhooks(self):
     `pending` payment exactly once."""
     try:
         return run_async(_reconcile)
+    except Exception as exc:
+        raise self.retry(exc=exc)
+
+
+@beat_task("payment-timeout")
+async def _timeout_pending() -> dict:
+    """Close payments no provider ever answered (T004-16).
+
+    A payment that stays `pending` past the window is one whose callback
+    never arrived — the STK prompt expired, the customer closed the sheet,
+    or the callback was lost. The subscription cannot stay in limbo forever
+    and the payment list cannot show "awaiting M-Pesa" for a week, so the
+    payment is marked `timeout`. That is a *state*, not a judgement: a real
+    success callback that arrives later is still honoured — the reconciler
+    re-opens a `timeout` payment when the provider's own payload says it
+    succeeded, and `_apply_payment` grants the time then.
+    """
+    now = _now()
+    cutoff = now - timedelta(hours=settings.payment_pending_timeout_hours)
+    timed_out = 0
+
+    async with session_scope() as db:
+        stale = list(
+            await db.scalars(
+                select(Payment)
+                .where(
+                    Payment.status == "pending",
+                    Payment.created_at < cutoff,
+                )
+                .order_by(Payment.created_at)
+                .limit(500)  # bounded; the next run picks up the rest
+            )
+        )
+        for payment in stale:
+            payment.status = "timeout"
+            timed_out += 1
+
+    return {"timed_out": timed_out}
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
+def timeout_pending_payments(self):
+    """Sweep long-pending payments to `timeout`. Idempotent: a payment
+    already in a terminal state is not selected."""
+    try:
+        return run_async(_timeout_pending)
     except Exception as exc:
         raise self.retry(exc=exc)
