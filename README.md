@@ -110,6 +110,32 @@ alembic upgrade head
 [`migrations/check_parity.py`](migrations/check_parity.py) compares the models
 against the migration history. Run it before opening a PR that changes a model.
 
+### A database that was never migrated
+
+`alembic upgrade head` only creates what is missing from an *empty* database.
+A database whose tables were created some other way — `Base.metadata.create_all`,
+a copy of an old dump, a Supabase project set up by hand — has tables that
+Alembic has never seen, so the first migration fails with `relation "users"
+already exists`, and every column a later migration added is simply absent.
+
+The symptom is confusing, because the failure does not arrive as a 404 or a
+500 with a readable body. A query against a missing column raises inside the
+router, and Starlette answers it from `ServerErrorMiddleware` — the outermost
+layer, *outside* `CORSMiddleware` — so the 500 carries no
+`Access-Control-Allow-Origin` header and the browser reports it as:
+
+> Access to fetch at '...' from origin '...' has been blocked by CORS policy:
+> No 'Access-Control-Allow-Origin' header is present on the requested resource.
+
+That is a server error wearing a CORS costume. `VisibleErrorMiddleware`
+(`app/core/errors.py`) now answers unhandled exceptions from inside the CORS
+layer, so the browser gets a legible `500` and the traceback in the log.
+
+The cure is still the migration. To rebuild a development database that was
+created outside Alembic: back up anything worth keeping, drop the stale tables
+(the `public` schema only — leave `auth` and the other schemas alone), then
+let the migrations build the schema from scratch with `alembic upgrade head`.
+
 ## Deployment
 
 [`railway.toml`](railway.toml) configures the API service. The worker and beat

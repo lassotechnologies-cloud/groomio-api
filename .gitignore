@@ -24,6 +24,9 @@ htmlcov/
 *.dump
 dump.rdb
 
+# Local development-database backups (rows of a real database — never commit)
+.dev-db-backup/
+
 # Editor / OS
 .DS_Store
 .idea/

@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 from app.core.deps import require_active_business
+from app.core.errors import VisibleErrorMiddleware
 from app.core.tenancy import TenantIsolationMiddleware
 
 app = FastAPI(
@@ -16,6 +17,20 @@ app = FastAPI(
     description="Operating system for Africa's grooming businesses",
 )
 
+# Middleware order matters, and `add_middleware` puts the most recently added
+# middleware on the OUTSIDE. So the registration order below reads inside-out:
+#
+#   TenantIsolationMiddleware → CORSMiddleware → VisibleErrorMiddleware → router
+#
+# `VisibleErrorMiddleware` is registered first so that it sits directly around
+# the router. That is the only position where it works: an unhandled exception
+# is otherwise answered by Starlette's `ServerErrorMiddleware`, which is
+# *outside* the CORS layer, so the browser receives a 500 with no
+# `Access-Control-Allow-Origin` header and reports a CORS policy failure
+# instead of the server error that actually happened. From in here the error
+# response is an ordinary response, and `CORSMiddleware` gives it the same
+# headers it gives everything else. See `app/core/errors.py`.
+app.add_middleware(VisibleErrorMiddleware)
 app.add_middleware(
     CORSMiddleware,
     # The list, not the raw comma-separated string: a string here makes Starlette
